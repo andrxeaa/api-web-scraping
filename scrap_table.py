@@ -120,4 +120,62 @@ def lambda_handler(event, context):
     # Obtener la tabla (verifica DDB_TABLE)
     try:
         table = ensure_table()
-    except ValueError
+    except ValueError as e:
+        LOG.error("Configuración inválida: %s", e)
+        return {
+            "statusCode": 500,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"error": "CONFIG_ERROR", "message": str(e)}),
+        }
+
+    # Determinar límite (queryStringParameters ?limit=)
+    limit = 10
+    if isinstance(event, dict):
+        qs = event.get("queryStringParameters") or {}
+        if qs and qs.get("limit"):
+            try:
+                limit = int(qs.get("limit"))
+            except Exception:
+                LOG.warning("Parámetro limit no válido, usando 10")
+
+    # Fetch
+    try:
+        items = fetch_latest_sismos(limit=limit)
+        LOG.info("Sismos obtenidos: %d", len(items))
+    except requests.HTTPError as e:
+        LOG.exception("HTTP error fetching ArcGIS layer")
+        return {
+            "statusCode": 502,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"error": "FETCH_ERROR", "detail": str(e)}),
+        }
+    except Exception as e:
+        LOG.exception("Error en fetch_latest_sismos")
+        return {
+            "statusCode": 500,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"error": "FETCH_ERROR", "detail": str(e)}),
+        }
+
+    # Escribir en DynamoDB
+    try:
+        if PREF_REPLACE_TABLE:
+            LOG.info("PREF_REPLACE_TABLE=true -> borrando tabla (solo IDs) antes de insertar")
+            ids = scan_all_ids(table)
+            if ids:
+                clear_table_by_ids(table, ids)
+
+        upsert_items(table, items)
+    except Exception as e:
+        LOG.exception("Error escribiendo en DynamoDB")
+        return {
+            "statusCode": 500,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"error": "DDB_ERROR", "detail": str(e)}),
+        }
+
+    return {
+        "statusCode": 200,
+        "headers": {"Content-Type": "application/json"},
+        "body": json.dumps({"count": len(items), "items": items}),
+    }
