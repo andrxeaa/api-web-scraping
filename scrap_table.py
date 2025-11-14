@@ -21,11 +21,15 @@ PREF_REPLACE_TABLE = os.environ.get("PREF_REPLACE_TABLE", "false").lower() == "t
 # Crear cliente/recursos boto3 aquí (pero no table hasta verificar DDB_TABLE)
 dynamodb = boto3.resource("dynamodb")
 
+
 def ensure_table():
     """Devuelve el objeto Table; lanza ValueError legible si falta DDB_TABLE."""
     if not DDB_TABLE:
-        raise ValueError("Variable de entorno DDB_TABLE no definida. Configure DDB_TABLE en serverless.yml.")
+        raise ValueError(
+            "Variable de entorno DDB_TABLE no definida. Configure DDB_TABLE en serverless.yml."
+        )
     return dynamodb.Table(DDB_TABLE)
+
 
 def parse_date(val):
     if val is None:
@@ -39,13 +43,14 @@ def parse_date(val):
             return str(val)
     return str(val)
 
+
 def fetch_latest_sismos(limit=10):
     params = {
         "where": "1=1",
         "outFields": "*",
         "orderByFields": "fechaevento DESC",
         "resultRecordCount": limit,
-        "f": "geojson"
+        "f": "geojson",
     }
     resp = requests.get(ARCGIS_LAYER_URL, params=params, timeout=15)
     resp.raise_for_status()
@@ -60,7 +65,9 @@ def fetch_latest_sismos(limit=10):
         lat = coords[1] if len(coords) >= 2 else (attrs.get("lat") or "")
 
         fecha_iso = parse_date(attrs.get("fechaevento") or attrs.get("FECHAEVENTO"))
-        item_id = str(attrs.get("code") or attrs.get("objectid") or attrs.get("OBJECTID") or uuid.uuid4())
+        item_id = str(
+            attrs.get("code") or attrs.get("objectid") or attrs.get("OBJECTID") or uuid.uuid4()
+        )
 
         item = {
             "id": item_id,
@@ -72,14 +79,45 @@ def fetch_latest_sismos(limit=10):
             "lat": str(lat) if lat != "" else "",
             "lon": str(lon) if lon != "" else "",
             "profundidad": str(attrs.get("profundidad") or attrs.get("prof") or ""),
-            "raw": {k: (v if v is not None else "") for k, v in attrs.items()}
+            "raw": {k: (v if v is not None else "") for k, v in attrs.items()},
         }
         items.append(item)
     return items
+
 
 def scan_all_ids(table):
     ids = []
     kwargs = {"ProjectionExpression": "id"}
     while True:
         resp = table.scan(**kwargs)
-        ids.exten
+        ids.extend([it["id"] for it in resp.get("Items", []) if "id" in it])
+        last = resp.get("LastEvaluatedKey")
+        if not last:
+            break
+        kwargs["ExclusiveStartKey"] = last
+    return ids
+
+
+def clear_table_by_ids(table, ids):
+    if not ids:
+        return
+    with table.batch_writer() as batch:
+        for _id in ids:
+            batch.delete_item(Key={"id": _id})
+
+
+def upsert_items(table, items):
+    if not items:
+        return
+    with table.batch_writer() as batch:
+        for it in items:
+            batch.put_item(Item=it)
+
+
+def lambda_handler(event, context):
+    LOG.info("Inicio Lambda: fetch latest sismos")
+
+    # Obtener la tabla (verifica DDB_TABLE)
+    try:
+        table = ensure_table()
+    except ValueError
