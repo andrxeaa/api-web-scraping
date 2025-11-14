@@ -1,90 +1,85 @@
 import os
+import json
 import uuid
+import logging
+from datetime import datetime, timezone, timedelta
+
 import requests
 import boto3
-from datetime import datetime
 
+LOG = logging.getLogger()
+LOG.setLevel(logging.INFO)
+
+# Config desde env (no creamos table todavía)
 DDB_TABLE = os.environ.get("DDB_TABLE")
-# Endpoint ArcGIS (IGP) - capa "Sismos Reportados"
-ARCGIS_LAYER_URL = "https://ide.igp.gob.pe/arcgis/rest/services/monitoreocensis/SismosReportados/MapServer/0/query"
+ARCGIS_LAYER_URL = os.environ.get(
+    "ARCGIS_LAYER_URL",
+    "https://ide.igp.gob.pe/arcgis/rest/services/monitoreocensis/SismosReportados/MapServer/0/query"
+)
+PREF_REPLACE_TABLE = os.environ.get("PREF_REPLACE_TABLE", "false").lower() == "true"
 
+# Crear cliente/recursos boto3 aquí (pero no table hasta verificar DDB_TABLE)
 dynamodb = boto3.resource("dynamodb")
-table = dynamodb.Table(DDB_TABLE)
+
+def ensure_table():
+    """Devuelve el objeto Table; lanza ValueError legible si falta DDB_TABLE."""
+    if not DDB_TABLE:
+        raise ValueError("Variable de entorno DDB_TABLE no definida. Configure DDB_TABLE en serverless.yml.")
+    return dynamodb.Table(DDB_TABLE)
+
+def parse_date(val):
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        try:
+            utc_dt = datetime.utcfromtimestamp(val / 1000).replace(tzinfo=timezone.utc)
+            pet = utc_dt.astimezone(timezone(timedelta(hours=-5)))
+            return pet.isoformat()
+        except Exception:
+            return str(val)
+    return str(val)
 
 def fetch_latest_sismos(limit=10):
     params = {
         "where": "1=1",
-        "outFields": "objectid,fechaevento,fecha,hora,mag,magnitud,ref,lat,lon,profundidad,prof,intento,departamento,code",
+        "outFields": "*",
         "orderByFields": "fechaevento DESC",
         "resultRecordCount": limit,
         "f": "geojson"
     }
-    resp = requests.get(ARCGIS_LAYER_URL, params=params, timeout=10)
+    resp = requests.get(ARCGIS_LAYER_URL, params=params, timeout=15)
     resp.raise_for_status()
     data = resp.json()
-    features = data.get("features", [])
+    features = data.get("features", []) or []
     items = []
     for feat in features:
         attrs = feat.get("properties") or feat.get("attributes") or {}
-        # Normalizar campos y convertir fechas (si vienen en ms)
-        fechaevento = attrs.get("fechaevento")
-        # ArcGIS date sometimes comes as milliseconds since epoch; intentar parsear
-        if isinstance(fechaevento, (int, float)):
-            try:
-                fecha_iso = datetime.utcfromtimestamp(fechaevento/1000).isoformat()
-            except Exception:
-                fecha_iso = str(fechaevento)
-        else:
-            fecha_iso = str(fechaevento) if fechaevento is not None else None
+        geom = feat.get("geometry") or {}
+        coords = geom.get("coordinates") or []
+        lon = coords[0] if len(coords) >= 1 else (attrs.get("lon") or "")
+        lat = coords[1] if len(coords) >= 2 else (attrs.get("lat") or "")
+
+        fecha_iso = parse_date(attrs.get("fechaevento") or attrs.get("FECHAEVENTO"))
+        item_id = str(attrs.get("code") or attrs.get("objectid") or attrs.get("OBJECTID") or uuid.uuid4())
 
         item = {
-            "id": str(attrs.get("code") or attrs.get("objectid") or str(uuid.uuid4())),
-            "fechaevento": fecha_iso,
+            "id": item_id,
+            "referencia": str(attrs.get("ref") or attrs.get("referencia") or ""),
+            "fechaevento": fecha_iso or "",
             "fecha": str(attrs.get("fecha") or ""),
             "hora": str(attrs.get("hora") or ""),
             "magnitud": str(attrs.get("magnitud") or attrs.get("mag") or ""),
-            "referencia": str(attrs.get("ref") or ""),
-            "lat": str(attrs.get("lat") or ""),
-            "lon": str(attrs.get("lon") or ""),
+            "lat": str(lat) if lat != "" else "",
+            "lon": str(lon) if lon != "" else "",
             "profundidad": str(attrs.get("profundidad") or attrs.get("prof") or ""),
-            "departamento": str(attrs.get("departamento") or ""),
-            # raw attributes for future use:
             "raw": {k: (v if v is not None else "") for k, v in attrs.items()}
         }
         items.append(item)
     return items
 
-def clear_table():
-    # Solo para mantener la tabla con últimos N: escanea y borra (coste de RCU en tablas grandes)
-    resp = table.scan(ProjectionExpression="id")
-    with table.batch_writer() as batch:
-        for it in resp.get("Items", []):
-            batch.delete_item(Key={"id": it["id"]})
-
-def lambda_handler(event, context):
-    try:
-        items = fetch_latest_sismos(limit=10)
-    except Exception as e:
-        return {"statusCode": 502, "body": f"Error fetching data: {str(e)}"}
-
-    # Opción A: reemplazar todo (borra los existentes y escribe los nuevos)
-    try:
-        # borrar (opcional)
-        scan = table.scan(ProjectionExpression="id")
-        if scan.get("Items"):
-            with table.batch_writer() as batch:
-                for each in scan["Items"]:
-                    batch.delete_item(Key={"id": each["id"]})
-    except Exception:
-        # no fatal; continuar con inserción
-        pass
-
-    # Insertar/actualizar
-    with table.batch_writer() as batch:
-        for it in items:
-            batch.put_item(Item=it)
-
-    return {
-        "statusCode": 200,
-        "body": {"count": len(items), "data": items}
-    }
+def scan_all_ids(table):
+    ids = []
+    kwargs = {"ProjectionExpression": "id"}
+    while True:
+        resp = table.scan(**kwargs)
+        ids.exten
