@@ -10,15 +10,14 @@ import boto3
 LOG = logging.getLogger()
 LOG.setLevel(logging.INFO)
 
-# Config desde env (no creamos table todavía)
-DDB_TABLE = os.environ.get("DDB_TABLE")
+# Si no se define DDB_TABLE en serverless.yml, usa la tabla creada en resources (TablaWebScrapping2)
+DDB_TABLE = os.environ.get("DDB_TABLE", "TablaWebScrapping2")
 ARCGIS_LAYER_URL = os.environ.get(
     "ARCGIS_LAYER_URL",
     "https://ide.igp.gob.pe/arcgis/rest/services/monitoreocensis/SismosReportados/MapServer/0/query"
 )
 PREF_REPLACE_TABLE = os.environ.get("PREF_REPLACE_TABLE", "false").lower() == "true"
 
-# Crear cliente/recursos boto3 aquí (pero no table hasta verificar DDB_TABLE)
 dynamodb = boto3.resource("dynamodb")
 
 
@@ -28,6 +27,7 @@ def ensure_table():
         raise ValueError(
             "Variable de entorno DDB_TABLE no definida. Configure DDB_TABLE en serverless.yml."
         )
+    LOG.debug("Usando tabla DynamoDB: %s", DDB_TABLE)
     return dynamodb.Table(DDB_TABLE)
 
 
