@@ -3,6 +3,7 @@ import json
 import uuid
 import logging
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal
 
 import requests
 import boto3
@@ -75,6 +76,8 @@ def fetch_latest_sismos(limit=10):
             "fechaevento": fecha_iso or "",
             "fecha": str(attrs.get("fecha") or ""),
             "hora": str(attrs.get("hora") or ""),
+            # mantengo como string para evitar conversiones innecesarias,
+            # los valores numéricos en 'raw' serán convertidos por convert_numbers
             "magnitud": str(attrs.get("magnitud") or attrs.get("mag") or ""),
             "lat": str(lat) if lat != "" else "",
             "lon": str(lon) if lon != "" else "",
@@ -106,12 +109,28 @@ def clear_table_by_ids(table, ids):
             batch.delete_item(Key={"id": _id})
 
 
+def convert_numbers(obj):
+    """
+    Convierte floats/ints (y números en estructuras anidadas) a Decimal para DynamoDB.
+    Mantiene strings y otros tipos tal cual.
+    """
+    if isinstance(obj, dict):
+        return {k: convert_numbers(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [convert_numbers(v) for v in obj]
+    if isinstance(obj, float) or isinstance(obj, int):
+        # Usar str() evita problemas de precisión y preserva formato
+        return Decimal(str(obj))
+    return obj
+
+
 def upsert_items(table, items):
     if not items:
         return
     with table.batch_writer() as batch:
         for it in items:
-            batch.put_item(Item=it)
+            # convert_numbers maneja floats/ints anidados (por ejemplo en 'raw')
+            batch.put_item(Item=convert_numbers(it))
 
 
 def lambda_handler(event, context):
