@@ -1,64 +1,90 @@
-import requests
-from bs4 import BeautifulSoup
-import boto3
+import os
 import uuid
+import requests
+import boto3
+from datetime import datetime
+
+DDB_TABLE = os.environ.get("DDB_TABLE")
+# Endpoint ArcGIS (IGP) - capa "Sismos Reportados"
+ARCGIS_LAYER_URL = "https://ide.igp.gob.pe/arcgis/rest/services/monitoreocensis/SismosReportados/MapServer/0/query"
+
+dynamodb = boto3.resource("dynamodb")
+table = dynamodb.Table(DDB_TABLE)
+
+def fetch_latest_sismos(limit=10):
+    params = {
+        "where": "1=1",
+        "outFields": "objectid,fechaevento,fecha,hora,mag,magnitud,ref,lat,lon,profundidad,prof,intento,departamento,code",
+        "orderByFields": "fechaevento DESC",
+        "resultRecordCount": limit,
+        "f": "geojson"
+    }
+    resp = requests.get(ARCGIS_LAYER_URL, params=params, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    features = data.get("features", [])
+    items = []
+    for feat in features:
+        attrs = feat.get("properties") or feat.get("attributes") or {}
+        # Normalizar campos y convertir fechas (si vienen en ms)
+        fechaevento = attrs.get("fechaevento")
+        # ArcGIS date sometimes comes as milliseconds since epoch; intentar parsear
+        if isinstance(fechaevento, (int, float)):
+            try:
+                fecha_iso = datetime.utcfromtimestamp(fechaevento/1000).isoformat()
+            except Exception:
+                fecha_iso = str(fechaevento)
+        else:
+            fecha_iso = str(fechaevento) if fechaevento is not None else None
+
+        item = {
+            "id": str(attrs.get("code") or attrs.get("objectid") or str(uuid.uuid4())),
+            "fechaevento": fecha_iso,
+            "fecha": str(attrs.get("fecha") or ""),
+            "hora": str(attrs.get("hora") or ""),
+            "magnitud": str(attrs.get("magnitud") or attrs.get("mag") or ""),
+            "referencia": str(attrs.get("ref") or ""),
+            "lat": str(attrs.get("lat") or ""),
+            "lon": str(attrs.get("lon") or ""),
+            "profundidad": str(attrs.get("profundidad") or attrs.get("prof") or ""),
+            "departamento": str(attrs.get("departamento") or ""),
+            # raw attributes for future use:
+            "raw": {k: (v if v is not None else "") for k, v in attrs.items()}
+        }
+        items.append(item)
+    return items
+
+def clear_table():
+    # Solo para mantener la tabla con últimos N: escanea y borra (coste de RCU en tablas grandes)
+    resp = table.scan(ProjectionExpression="id")
+    with table.batch_writer() as batch:
+        for it in resp.get("Items", []):
+            batch.delete_item(Key={"id": it["id"]})
 
 def lambda_handler(event, context):
-    # URL de la página web que contiene la tabla
-    url = "https://sgonorte.bomberosperu.gob.pe/24horas/?criterio=/"
+    try:
+        items = fetch_latest_sismos(limit=10)
+    except Exception as e:
+        return {"statusCode": 502, "body": f"Error fetching data: {str(e)}"}
 
-    # Realizar la solicitud HTTP a la página web
-    response = requests.get(url)
-    if response.status_code != 200:
-        return {
-            'statusCode': response.status_code,
-            'body': 'Error al acceder a la página web'
-        }
+    # Opción A: reemplazar todo (borra los existentes y escribe los nuevos)
+    try:
+        # borrar (opcional)
+        scan = table.scan(ProjectionExpression="id")
+        if scan.get("Items"):
+            with table.batch_writer() as batch:
+                for each in scan["Items"]:
+                    batch.delete_item(Key={"id": each["id"]})
+    except Exception:
+        # no fatal; continuar con inserción
+        pass
 
-    # Parsear el contenido HTML de la página web
-    soup = BeautifulSoup(response.content, 'html.parser')
-
-    # Encontrar la tabla en el HTML
-    table = soup.find('table')
-    if not table:
-        return {
-            'statusCode': 404,
-            'body': 'No se encontró la tabla en la página web'
-        }
-
-    # Extraer los encabezados de la tabla
-    headers = [header.text for header in table.find_all('th')]
-
-    # Extraer las filas de la tabla
-    rows = []
-    for row in table.find_all('tr')[1:]:  # Omitir el encabezado
-        cells = row.find_all('td')
-        rows.append({headers[i+1]: cell.text for i, cell in enumerate(cells)})
-
-    # Guardar los datos en DynamoDB
-    dynamodb = boto3.resource('dynamodb')
-    table = dynamodb.Table('TablaWebScrapping')
-
-    # Eliminar todos los elementos de la tabla antes de agregar los nuevos
-    scan = table.scan()
+    # Insertar/actualizar
     with table.batch_writer() as batch:
-        for each in scan['Items']:
-            batch.delete_item(
-                Key={
-                    'id': each['id']
-                }
-            )
+        for it in items:
+            batch.put_item(Item=it)
 
-    # Insertar los nuevos datos
-    i = 1
-    for row in rows:
-        row['#'] = i
-        row['id'] = str(uuid.uuid4())  # Generar un ID único para cada entrada
-        table.put_item(Item=row)
-        i = i + 1
-
-    # Retornar el resultado como JSON
     return {
-        'statusCode': 200,
-        'body': rows
+        "statusCode": 200,
+        "body": {"count": len(items), "data": items}
     }
